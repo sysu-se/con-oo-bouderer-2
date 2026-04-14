@@ -180,54 +180,180 @@ View **不直接消费 `Game` 对象**，而是通过 **store adapter（`gameSes
 
 ## 5. Svelte 响应式机制说明
 
-### 5.1 依赖的响应式机制
+### 5.1 本方案依赖的响应式机制
 
-本方案依赖 **Svelte writable store + derived store + `$` 自动订阅**。
+本方案依赖 **Svelte 3 的 store 机制**，具体包括：
 
-`gameSession` 是一个自定义 store：
+- **`writable` store**：`gameSession` 内部用 `writable()` 创建，持有 `Game` 对象及其快照
+- **`derived` store**：`grid`、`userGrid`、`invalidCells`、`canUndo`、`canRedo`、`gameWon` 都是从 `gameSession` 派生的 derived store
+- **`$` 自动订阅**：组件中用 `$grid`、`$userGrid`、`$gameWon` 语法自动订阅，Svelte 编译器会自动生成订阅/取消订阅代码
 
-- 内部持有 `Game` 对象
-- 对外暴露 `guess/undo/redo/applyHint/startNew/startCustom`
-- 每次操作后重新计算 view state：
-  - `initialGrid`
-  - `currentGrid`
-  - `invalidCells`
-  - `solved`
-  - `canUndo`
-  - `canRedo`
-- 通过 store 的 `set/update` 触发订阅者更新
+不依赖 `$:` reactive statement 或顶层 `let` 重新赋值来驱动更新。所有响应式更新都走 store 通道。
 
-组件中用 `$grid`、`$userGrid`、`$gameWon` 等语法自动订阅。
+### 5.2 UI 为什么会更新
 
-### 5.2 如果错误地直接 mutate 对象会怎样
+更新的完整路径：
 
-如果绕过 store adapter 直接：
+1. 用户操作触发 `gameSession` 的方法（如 `guess`、`undo`）
+2. 方法内部调用 `Game` 的领域接口修改状态
+3. 修改完成后，`mutateGame` 调用 store 的 `update()`，传入一个**全新的快照对象**（由 `snapshotGame()` 生成）
+4. `writable` store 检测到值被替换，通知所有订阅者
+5. `derived` store（`grid`、`userGrid` 等）收到通知，重新从快照中提取对应字段
+6. 组件中的 `$grid`、`$userGrid` 拿到新值，Svelte 触发 DOM 更新
 
-- 拿到 `Game` 对象后调用方法
-- 直接修改 `Sudoku._grid[row][col]`
-- 不通过 store 的更新方法
+关键点在于：**每次操作后都会生成一个全新的快照对象传给 store**，而不是修改旧对象。这确保了 store 能检测到变化。
 
-则 Svelte 不会知道数据发生了变化，界面不会刷新。
+### 5.3 为什么修改对象内部字段后，界面不一定自动更新
 
-这是因为 Svelte 3 的响应式机制基于**赋值触发**：
+Svelte 3 的响应式机制基于**赋值触发**（assignment-driven reactivity）：
 
-> 只有顶层变量的赋值，或 store 的 `set`/`update` 调用，才会通知 Svelte 重新渲染。
+- 对于顶层 `let` 变量，只有**对变量本身重新赋值**才会触发更新
+- 对于 store，只有调用 `set()` / `update()` 才会通知订阅者
 
-本方案通过 **store adapter** 解决：
+如果只修改对象的内部字段：
 
-- 所有修改都通过 adapter 方法
-- adapter 每次操作后调用 `update()` 写入新的快照
-- Svelte 检测到 store 值变化，自动刷新
+```js
+let obj = { name: 'a' };
+obj.name = 'b'; // Svelte 不会更新，因为 obj 的引用没变
+obj = obj;       // 这样才会触发更新（重新赋值了 obj 本身）
+```
 
-### 5.3 哪些状态对 UI 可见，哪些不可见
+原因是 Svelte 3 的编译器在编译阶段静态分析代码，只对**顶层变量的赋值语句**插入 `$$invalidate` 调用。修改对象内部属性不是对变量的赋值，编译器不会插入通知代码，所以 Svelte 根本不知道数据变了。
+
+对应到本项目：如果拿到 `Game` 对象后直接调用 `game.guess(...)` 但不调用 store 的 `update()`，store 的值引用没变，Svelte 不会收到任何通知，界面不会刷新。
+
+### 5.4 为什么直接改二维数组元素，Svelte 不会按预期刷新
+
+```js
+let grid = [[1,2,3], [4,5,6], [7,8,9]];
+grid[0][1] = 99; // 界面不刷新
+```
+
+这和上一个问题本质相同：`grid[0][1] = 99` 修改的是数组内部嵌套元素，`grid` 变量本身的引用没有变化，Svelte 编译器不会对这一行插入 `$$invalidate`。
+
+要让 Svelte 感知到变化，必须触发对 `grid` 本身的赋值：
+
+```js
+grid[0][1] = 99;
+grid = grid; // 手动触发重新赋值
+```
+
+或者换成生成新数组：
+
+```js
+grid = grid.map((row, i) => i === 0 ? [...row.slice(0,1), 99, ...row.slice(2)] : row); //
+```
+
+本方案完全避开了这个陷阱：`snapshotGame()` 每次都通过 `game.getSudoku().getGrid()` 取出 grid 数据，作为新快照对象的一部分传入 `update()`，store 值整体被替换，不存在"只改了嵌套元素"的情况。
+
+### 5.5 为什么 store 可以被 `$store` 消费
+
+Svelte 的 `$store` 语法是编译器的**语法糖**。在编译阶段，Svelte 会将 `$store` 展开为：
+
+1. 在组件初始化时调用 `store.subscribe(callback)` 订阅
+2. 每次 store 值变化时，callback 更新一个内部变量
+3. 组件销毁时自动调用 `unsubscribe()` 取消订阅
+
+任何对象只要实现了 `subscribe` 方法（符合 Svelte 的 store contract），就可以用 `$` 前缀消费。Svelte 的 store contract 非常简单：
+
+```js
+// 一个合法的 store 只需要有 subscribe 方法
+const store = {
+  subscribe(callback) {   // callback 接收当前值
+    // ... 注册监听
+    return () => { /* 取消监听 */ };
+  }
+};
+```
+
+`writable()` 和 `derived()` 都返回符合这个 contract 的对象。本项目中的 `grid` 和 `userGrid` 虽然是自定义对象，但它们的 `subscribe` 属性分别指向 `initialGridStore.subscribe` 和 `userGridStore.subscribe`（都是 derived store），所以也可以被 `$grid`、`$userGrid` 消费。
+
+### 5.6 为什么 `$:` 有时会更新，有时不会更新
+
+`$:` 是 Svelte 3 的 reactive statement，编译器会**静态分析**语句中引用了哪些顶层变量，当这些变量被重新赋值时触发重新执行。
+
+会更新的情况：
+
+```js
+let count = 0;
+$: doubled = count * 2; // count 被重新赋值时，doubled 会更新
+```
+
+不会更新的情况：
+
+```js
+let obj = { count: 0 };
+$: doubled = obj.count * 2;
+obj.count = 5; // obj 本身没有被重新赋值，$: 不会重新执行
+```
+
+编译器只追踪**顶层变量名**的赋值。`obj.count = 5` 修改的是 `obj` 的属性，不是对 `obj` 的赋值，所以编译器不会认为 `$: doubled = obj.count * 2` 的依赖发生了变化。
+
+### 5.7 为什么"间接依赖"可能导致 reactive statement 不触发
+
+"间接依赖"指的是：reactive statement 实际依赖的数据，并没有以顶层变量的形式出现在语句中。
+
+```js
+let game = createGame();
+$: grid = game.getGrid();
+
+// 用户操作后
+game.guess({ row: 0, col: 0, value: 5 }); // 修改了 game 内部状态
+// $: grid = game.getGrid() 不会重新执行
+// 因为 game 变量本身没有被重新赋值
+```
+
+编译器看到的是：`$: grid = game.getGrid()` 依赖 `game`。但 `game.guess(...)` 只是调用了 `game` 的方法，并没有对 `game` 重新赋值，所以 reactive statement 不会重新执行。
+
+这正是为什么本方案不采用"直接在组件中持有 `Game` 对象 + `$:` 派生状态"的方式，而是采用 **store adapter**：
+
+- store adapter 内部持有 `Game`，但不把 `Game` 暴露给组件
+- 每次操作后通过 `update()` 推送一个**新的 plain data 快照**
+- 组件通过 `$store` 订阅，store 值变化就会更新，不存在间接依赖问题
+
+### 5.8 如果错误地直接 mutate 对象，会出什么问题
+
+如果绕过 store adapter，直接操作领域对象：
+
+```js
+// 错误做法 1：直接拿到 Game 调用方法
+const game = getGameFromSomewhere();
+game.guess({ row: 0, col: 0, value: 5 });
+// 数据变了，但 store 不知道，界面不刷新
+
+// 错误做法 2：直接改 Sudoku 内部数组
+game.getSudoku()._grid[0][0] = 5;
+// 绕过了领域对象的校验，也绕过了 store，界面不刷新
+
+// 错误做法 3：拿到 store 里的快照后直接改
+$gameSession.currentGrid[0][0] = 5;
+// 改的是快照对象，Game 不知道，store 不知道，界面也不会刷新
+```
+
+这三种做法的共同问题是：**修改发生在 store 的 `set`/`update` 之外**，Svelte 没有被通知，界面保持旧状态。
+
+本方案通过 `mutateGame` 函数统一处理：
+
+```js
+const mutateGame = (mutator) => {
+    update((state) => {
+        mutator(state.game);        // 在 update 回调内修改 Game
+        return snapshotGame(state.game); // 返回全新快照
+    });
+};
+```
+
+所有修改都发生在 `update()` 回调内，回调返回新快照，store 自动通知所有订阅者。这确保了**领域对象的任何变化都会同步反映到 UI**。
+
+### 5.9 哪些状态对 UI 可见，哪些不可见
 
 对 UI 可见（通过 store 暴露）：
 
-- 当前 grid
-- 初始 grid
-- 冲突格
-- 是否已解决
-- 能否 undo / redo
+- `initialGrid`：初始题面
+- `currentGrid`：当前盘面
+- `invalidCells`：冲突格列表
+- `solved`：是否已解决
+- `canUndo` / `canRedo`：能否撤销/重做
 
 对 UI 不可见（留在领域对象内部）：
 
